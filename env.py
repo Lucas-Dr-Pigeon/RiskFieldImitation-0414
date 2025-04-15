@@ -35,16 +35,21 @@ def convert_highd_sample_to_gail_expert(sample_csv, meta_csv, forward=True, p_ag
     lanemarkers = marks[1:-1]
     boundarylines[0] -= 0.25
     boundarylines[1] += 0.25
-    lanecenters = np.concatenate((boundarylines[:1], lanemarkers, boundarylines[-1:]))
+    lanecenters = (marks[:-1] + marks[1:])/2
+    lanecenters = lanecenters if forward else lanecenters[::-1]
     
     # Compute vehicle center positions
     df['center_x'] = df['x'] + 0.5 * df['width']
     df['center_y'] = df['y'] + 0.5 * df['height']
 
     # Get road start:
-    road_start = df['center_x'].min() - 10.0 if forward else df['center_x'].max() + 10.0 
-    road_end = df['center_x'].max() + 10.0 if forward else df['center_x'].min() - 10.0
+    road_start = df['center_x'].min() + 30.0 if forward else df['center_x'].max() - 30.0 
+    road_end = df['center_x'].max() - 30.0 if forward else df['center_x'].min() + 30.0
     
+    # Screenline check
+    segment_mask = ((df['center_x'] + 0.5 * df['width']) >= road_start ) & ((df['center_x'] - 0.5 * df['width']) <= road_end ) if forward else \
+                    ((df['center_x'] - 0.5 * df['width']) <= road_start ) & ((df['center_x'] + 0.5 * df['width']) >= road_end )
+    df = df[segment_mask]
     # # Resample frames: select frames where frame % 5 == 0 (0.2 sec intervals)
     # df = df[df['frame'] % 5 == 0]
 
@@ -54,7 +59,15 @@ def convert_highd_sample_to_gail_expert(sample_csv, meta_csv, forward=True, p_ag
     last_lanecenters = lanecenters[laneindices]
     veh_last_lanecenters = pd.Series(last_lanecenters, index=veh_last_y.index)
     df['yTarget'] = df['id'].map(veh_last_lanecenters)
-    
+
+    # Reindex lane centers
+    df['_laneId'] = np.argmin( np.abs(lanecenters - df.center_y.values.reshape(-1,1)), axis=1)
+
+    # Get truck ratios per lane
+    num_cars = np.array([ df[(df._laneId==l)&(df.width<10)].id.nunique() for l in range(len(lanecenters))])
+    num_trucks = np.array([ df[(df._laneId==l)&(df.width>=10)].id.nunique() for l in range(len(lanecenters))])
+    lane_truck_ratios = num_trucks / (num_cars + num_trucks)
+
     # Sort frames
     frames = sorted(df['frame'].unique())
     expert_frames = []
@@ -71,6 +84,9 @@ def convert_highd_sample_to_gail_expert(sample_csv, meta_csv, forward=True, p_ag
         frame_data['agent_status'] = agent_status_list
         expert_frames.append(frame_data)
     
+    lane_arrival_rates = get_lane_arrival_rates(df)
+    lane_change_ratios = get_lane_change_ratios(df)
+    lane_avg_speeds = get_lane_average_speed(df)
     
     expert_data = {
         'frames': expert_frames,
@@ -79,9 +95,63 @@ def convert_highd_sample_to_gail_expert(sample_csv, meta_csv, forward=True, p_ag
         'lanecenters': lanecenters,
         'start': road_start,
         'end': road_end,
+        'lane_arrival_rates': lane_arrival_rates,
+        'lane_change_ratios': lane_change_ratios,
+        'lane_avg_speeds': lane_avg_speeds,
+        'lane_truck_ratios': lane_truck_ratios
     }
     
     return expert_data, df
+
+def get_lane_arrival_rates(df):
+    # Assume df is your DataFrame with columns: 'id', 'frame', 'laneId'
+    global_first_frame = df['frame'].min()
+    # Get the time length of dataset in seconds
+    lenT = (df['frame'].max() - df['frame'].min()) * (1/25)
+    # For each vehicle, get the first appearance (minimum frame)
+    first_appearance = df.sort_values('frame').groupby('id', as_index=False).first()
+    # Exclude vehicles that first appear in the global first frame
+    first_appearance_after = first_appearance[first_appearance['frame'] > global_first_frame]
+    # Create a mapping (or simply keep the columns 'id' and 'laneId')
+    first_appearance_laneId = first_appearance_after[['id', '_laneId']]
+    # Get the number of vehicles spawned on each lane
+    lane_vehicles_spawned = first_appearance_laneId.groupby('_laneId').size()
+    # Get the number arrival ratio per lane, from left to right
+    lane_arrival_ratio = lane_vehicles_spawned / lenT
+    # Reverse if backward
+    lane_arrival_ratio = lane_arrival_ratio.values 
+    return lane_arrival_ratio
+
+def get_lane_change_ratios(df):
+    # For each vehicle, get the first appearance (minimum frame)
+    first_appearance = df.sort_values('frame').groupby('id', as_index=False).first()
+    # last appearance 
+    last_appearance = df.sort_values('frame').groupby('id', as_index=False).last()
+    # get arrival and departure lane map
+    arrival_lane_map = first_appearance[['id', '_laneId']].set_index('id')
+    departure_lane_map = last_appearance[['id', '_laneId']].set_index('id')
+    # Combine into a DataFrame.
+    arr_depart = pd.DataFrame({
+        'arrival': arrival_lane_map._laneId,
+        'departure': departure_lane_map._laneId
+    }, index=arrival_lane_map.index)
+    # Create a contingency table that counts vehicles for each (arrival, departure) pair.
+    table = pd.crosstab(arr_depart['arrival'], arr_depart['departure'])
+    # Determine all lanes that appear in either series.
+    all_lanes = sorted(set(arrival_lane_map._laneId.unique()) | set(departure_lane_map._laneId.unique()))
+    # Reindex the table to ensure it has rows and columns for all lanes.
+    # This fills missing rows/columns with 0.
+    table = table.reindex(index=all_lanes, columns=all_lanes, fill_value=0)
+    # Normalize each row (arrival lane) so that they sum to 1.
+    M = table.div(table.sum(axis=1), axis=0).values
+    # reverse the table if backward
+    lcRatio = M 
+    return lcRatio
+
+def get_lane_average_speed(df):
+    lane_vel = df.groupby('_laneId').xVelocity.mean().values
+    lane_avg_vel = lane_vel 
+    return lane_avg_vel
 
 def overwrite_y_acceleration_expert(df, dt=1/25):
     step = int(dt * 25)
@@ -109,42 +179,62 @@ class HighwayEnv(gym.Env):
                  N_max=100,
                  dt=0.2,
                  T=4,
-                 arrival_rate=0.1,
-                 avg_speed=20.0,
+                 arrival_rate=[0.1, 0.1, 0.1],
+                 avg_speed=[20.0, 20.0, 20.0],
                  lanemarkers=[34.69,38.42],
                  boundarylines=[30.6,42.63],
-                 lanechange_intensity=[[0.8,0.15,0.05],[0.1,0.8,0.1],[0.05,0.15,0.8]],
-                 p_agent=0.5):
+                 lane_change_ratio=[[0.8,0.15,0.05],[0.1,0.8,0.1],[0.05,0.15,0.8]],
+                 lane_truck_ratio=[0.1, 0.0, 0.1],
+                 generation_mode=False,
+                 demo_mode=False,
+                 total_steps=600,
+                 remove_crash=True,
+                 ):
         super(HighwayEnv, self).__init__()
         
         # Road parameters (to be updated via expert data if available)
         self.road_start = road_start
         self.road_end = road_end
-        self.lanemarkers = lanemarkers     # Lane marker positions (y-values)
-        self.boundarylines = boundarylines      # Two values: [lower_boundary, upper_boundary]
+        # Lane marker positions (y-values)
+        self.lanemarkers = lanemarkers     
+        # Two values: [lower_boundary, upper_boundary]
+        self.boundarylines = boundarylines      
+        # get the lane centers' positions
         self.lanecenters = np.concatenate((boundarylines[:1], lanemarkers, boundarylines[-1:]))   # Get the lane center positions
-        
+        # the max number of vehicles allowed on the road
         self.N_max = N_max
+        # the second between consecutive frames
         self.dt = dt
+        # the length of history in feature sets
         self.T = T
-        self.arrival_rate = arrival_rate
-        self.avg_speed = avg_speed
-        self.lanechange_intensity = lanechange_intensity
-        self.p_agent = p_agent    # probability for a vehicle to be agent-controlled
-        
+        # the arrival rate of traffic each lanes
+        self.lane_arrival_rate = arrival_rate
+        # the average speed each lanes
+        self.lane_avg_speed = avg_speed
+        # the intensity of lane changing between lanes
+        self.lane_change_ratio = lane_change_ratio
+        # the truck ratio per lane
+        self.lane_truck_ratio = lane_truck_ratio
+        # set if the environment is in a generation mode
+        self.generation_mode = generation_mode
+        # set if the environment is in a demo mode
+        self.demo_mode = demo_mode
         # Kinematic state now has 7 elements: [x, y, xVelocity, yVelocity, length, width, id]
         self.M1 = 8
         # Time-independent features remain: [vehicle_length, vehicle_width, agent_indicator, target]
-        self.M2 = 4
-
+        self.M2 = 2
+        # Number of total steps to roll-out
+        self.total_steps = total_steps
+        # Remove colliding agents
+        self.remove_crash_agents = remove_crash
         # Define observation space.
         # time_dependent observations now only include the first 4 columns.
         self.observation_space = gym.spaces.Dict({
-            'time_dependent': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.T, self.N_max, 4), dtype=np.float32),
-            'time_independent': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.N_max, self.M2), dtype=np.float32),
+            'time_dependent': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.T, self.N_max, 7), dtype=np.float32),
+            # 'time_independent': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.N_max, self.M2), dtype=np.float32),
             'lane_markers': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32),  # arbitrary max shape
             'boundary_lines': gym.spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
-            'mask': gym.spaces.Box(low=0, high=1, shape=(self.N_max,), dtype=np.float32),
+            # 'mask': gym.spaces.Box(low=0, high=1, shape=(self.N_max,), dtype=np.float32),
             'agent_mask': gym.spaces.Box(low=0, high=1, shape=(self.N_max,), dtype=np.float32)
         })
 
@@ -157,7 +247,7 @@ class HighwayEnv(gym.Env):
         self.exists = torch.zeros(self.N_max, dtype=torch.bool)
         self.agent_mask = torch.zeros(self.N_max, dtype=torch.bool)
         # Time-independent features: [vehicle_length, vehicle_width, agent_indicator]
-        self.features = torch.full((self.N_max, self.M2), float('nan'))
+        # self.features = torch.full((self.N_max, self.M2), float('nan'))
         self.history = torch.full((self.T, self.N_max, self.M1), float('nan'))
         
         # Track vehicle ids separately for easier lookup.
@@ -167,7 +257,6 @@ class HighwayEnv(gym.Env):
         self.expert_data = None
         self.expert_frame_idx = 0
 
-        # check each lane
 
     def set_expert_data(self, expert_data, rectify_y=True):
         """
@@ -185,19 +274,26 @@ class HighwayEnv(gym.Env):
         self.kinematics = torch.full((self.N_max, self.M1), float('nan') )
         self.exists = torch.zeros(self.N_max, dtype=torch.bool)
         self.agent_mask = torch.zeros(self.N_max, dtype=torch.bool)
-        self.features = torch.full((self.N_max, self.M2), float('nan'))
+        # self.features = torch.full((self.N_max, self.M2), float('nan'))
         self.vehicle_ids = torch.full((self.N_max,), -1, dtype=torch.int64)
         self.history = torch.full((self.T, self.N_max, self.M1), float('nan'))
+        self.expert_mask = torch.zeros(self.N_max, dtype=torch.bool)
+        self.cumu_id = 100
+        # 
+        self.dead = set()
         
         if self.expert_data is not None:
-            first_frame = self.expert_data['frames'][0]
             self.road_start = self.expert_data['start']
             self.road_end = self.expert_data['end']
+            first_frame = self.expert_data['frames'][0]
             self.lanemarkers = self.expert_data['lanemarkers']
             self.boundarylines = self.expert_data['boundarylines']
             self.lanecenters = self.expert_data['lanecenters']
-            
-            num_vehicles = min(len(first_frame), self.N_max)
+            self.lane_arrival_rate = self.expert_data['lane_arrival_rates']
+            self.lane_change_ratio = self.expert_data['lane_change_ratios']
+            self.lane_avg_speed = self.expert_data['lane_avg_speeds']
+            self.lane_truck_ratio = self.expert_data['lane_truck_ratios']
+            self.total_steps = len(self.expert_data['frames'])
             for i, (_, row) in enumerate(first_frame.iterrows()):
                 if i >= self.N_max:
                     break
@@ -212,29 +308,26 @@ class HighwayEnv(gym.Env):
                 vehicle_id = int(row['id'])
                 self.kinematics[i] = torch.tensor([x, y, xVel, yVel, length, width, vehicle_id, target], dtype=torch.float32)
                 self.exists[i] = True
-                is_agent = bool(row['agent_status'])
-                self.agent_mask[i] = is_agent
-                self.features[i] = torch.tensor([length, width, target, 1.0 if is_agent else 0.0], dtype=torch.float32)
                 self.vehicle_ids[i] = vehicle_id
+                if self.generation_mode:
+                    is_agent = False 
+                else:
+                    # Get 'right-half' vehicle mask. Set these vehicles as 'Background vehicle'
+                    right_ = x >= self.road_end - (self.road_end - self.road_start)*0.75 if self.road_end > self.road_start else\
+                                x <= self.road_end + (self.road_start - self.road_end)*0.75
+                    is_agent = False if right_ else bool(row['agent_status']) 
+                self.agent_mask[i] = is_agent
+                # self.features[i] = torch.tensor([length, width, target, 1.0 if is_agent else 0.0], dtype=torch.float32)
+            self.expert_mask = ~self.agent_mask
             self.expert_frame_idx = 0
-        else:
-            self.kinematics[0] = torch.tensor([self.road_start,
-                                                (self.road_end - self.road_start) / 2,
-                                                self.default_speed,
-                                                0.0,
-                                                self.default_length,
-                                                self.default_width,
-                                                0], dtype=torch.float32)
-            self.exists[0] = True
-            is_agent = (np.random.rand() < self.p_agent)
-            self.agent_mask[0] = is_agent
-            self.features[0] = torch.tensor([self.default_length, self.default_width, target, 1.0 if is_agent else 0.0], dtype=torch.float32)
-            self.vehicle_ids[0] = 0
-        
+            self.cumu_id = first_frame.id.max()
+        # get the first kinematics array
         self.history[-1] = self.kinematics
-
-        # get the last vehicles 
-
+        # get static states
+        self.lane_markers_tensor = torch.full((10,), float('nan')) 
+        self.lane_markers_tensor[:len(self.lanemarkers)] = torch.tensor(self.lanemarkers).clone()
+        self.boundary_lines_tensor = torch.tensor(self.boundarylines, dtype=torch.float32) if self.boundarylines.size else torch.tensor([])
+        # get the initial states
         return self._get_obs()
 
     def step(self, actions):
@@ -258,6 +351,9 @@ class HighwayEnv(gym.Env):
         ids = self.kinematics[:, 6].unsqueeze(1)  # vehicle ids
         targets = self.kinematics[:, 7].unsqueeze(1)
         
+        '''
+        Stage I: Update Agent & BV Kinematics 
+        '''
         # If expert data is available, process the current expert frame.
         if self.expert_data is not None and self.expert_frame_idx < len(self.expert_data['frames']):
             current_expert_frame = self.expert_data['frames'][self.expert_frame_idx]
@@ -275,76 +371,181 @@ class HighwayEnv(gym.Env):
                         self.vehicle_ids[i] = -1
             # For each background vehicle still present, override its acceleration.
             for i in range(self.N_max):
-                if self.exists[i] and not self.agent_mask[i]:
+                if (self.exists[i] and not self.agent_mask[i]) or self.demo_mode:
                     current_id = int(self.vehicle_ids[i].item())
                     row = current_expert_frame[current_expert_frame['id'] == current_id]
                     if not row.empty:
                         row_val = row.iloc[0]
                         actions[i] = torch.tensor([row_val['xAcceleration'], row_val['yAcceleration']], dtype=torch.float32)
             # Note: We do not increment expert_frame_idx here.
-        
+
+
         new_positions = positions + velocities * dt + 0.5 * actions * (dt ** 2)
         new_velocities = velocities + actions * dt
         updated_state = torch.cat([new_positions, new_velocities, dims, ids, targets], dim=1)
         self.kinematics = torch.where(exists_float.bool(), updated_state, self.kinematics)
-        
+
+        '''
+        Stage II: Remove Exiting Vehicles
+        '''
         # Remove vehicles that exceed the road's end (assumed along the x-axis).
-        exceed = self.kinematics[:, 0] > self.road_end
+        exceed = self.kinematics[:, 0]-0.5*self.kinematics[:, 4] > self.road_end if self.road_end > self.road_start else self.kinematics[:, 0]+0.5*self.kinematics[:, 4] < self.road_end
         self.kinematics[exceed] = float('nan')
         self.exists[exceed] = False
         self.agent_mask[exceed] = False
+        self.dead.update(self.vehicle_ids[exceed].tolist())
         self.vehicle_ids[exceed] = -1
-        self.features[exceed] = float('nan')
-
+        # self.features[exceed] = float('nan')
+        
         # print (self.kinematics[:,0])
         
-        # Remove vehicles that collide with boundaries.
+        '''
+        Stage III: Handle Colliding Agents
+        '''
+        # Convert to background vehicles that collide with boundaries.
         if self.boundarylines.size == 2:
             lower_bound, upper_bound = self.boundarylines
             collide = (self.kinematics[:, 1] < lower_bound) | (self.kinematics[:, 1] > upper_bound)
-            self.kinematics[collide, 2:4] = float('nan')
+            self.kinematics[collide, 2:4] = 0
             self.agent_mask[collide] = False
+
+        '''
+        Stage IV: Spawn New Vehicles
+        '''
+        if not self.generation_mode:
+            # Spawn new vehicles from expert data into empty slots, if not already present.
+            if self.expert_data is not None and self.expert_frame_idx < len(self.expert_data['frames']):
+                expert_frame = self.expert_data['frames'][self.expert_frame_idx]
+                active_ids = set(self.vehicle_ids[self.exists].tolist())
+                for idx, row in expert_frame.iterrows():
+                    vehicle_id = int(row['id'])
+                    if vehicle_id in active_ids or vehicle_id in self.dead:
+                        continue
+                    # add a screen-line
+                    empty_slots = torch.nonzero(~self.exists, as_tuple=False)
+                    if empty_slots.numel() > 0:
+                        slot = int(empty_slots[0])
+                        x = row['center_x']
+                        y = row['center_y']
+                        xVel = row['xVelocity']
+                        yVel = row['yVelocity']
+                        # Correction: 'width' is vehicle length, 'height' is vehicle width.
+                        length = row['width']
+                        width = row['height']
+                        target = row['yTarget']
+                        # Screenline check
+                        screenline_check =  x + 0.5*length >= self.road_start if self.road_start < self.road_end else x - 0.5*length <= self.road_start
+                        _ = print (row['id']) if not screenline_check else 0
+                        # if not screenline_check:
+                        #     continue
+                        # Spawn this vehicle
+                        self.kinematics[slot] = torch.tensor([x, y, xVel, yVel, length, width, vehicle_id, target], dtype=torch.float32)
+                        self.exists[slot] = True
+                        is_agent = bool(row['agent_status'])
+                        self.agent_mask[slot] = is_agent
+                        # self.features[slot] = torch.tensor([length, width, target, 1.0 if is_agent else 0.0], dtype=torch.float32)
+                        self.vehicle_ids[slot] = vehicle_id
+                # (Do not increment here either.)
+            
+            # Advance expert_frame_idx based on self.dt.
+            if self.expert_data is not None:
+                skip = int(self.dt * 25)  # For example, dt=0.2 -> skip=5 frames.
+                self.expert_frame_idx += skip
         
-        # Spawn new vehicles from expert data into empty slots, if not already present.
-        if self.expert_data is not None and self.expert_frame_idx < len(self.expert_data['frames']):
-            expert_frame = self.expert_data['frames'][self.expert_frame_idx]
-            active_ids = set(self.vehicle_ids[self.exists].tolist())
-            for idx, row in expert_frame.iterrows():
-                vehicle_id = int(row['id'])
-                if vehicle_id in active_ids:
+        else:
+            '''
+            Implement generation spawning     
+            
+            '''
+            # Spawn new vehicles for generator into empty slots, if not already present.
+            empty_slots = torch.nonzero(~self.exists, as_tuple=False) 
+            for l, lcenter in enumerate(self.lanecenters):
+                ar = self.lane_arrival_rate[l] 
+                p_spawn = 1 - np.exp(-ar * dt)
+                if p_spawn < np.random.rand():
                     continue
-                empty_slots = torch.nonzero(~self.exists, as_tuple=False)
-                if empty_slots.numel() > 0:
-                    slot = int(empty_slots[0])
-                    x = row['center_x']
-                    y = row['center_y']
-                    xVel = row['xVelocity']
-                    yVel = row['yVelocity']
-                    # Correction: 'width' is vehicle length, 'height' is vehicle width.
-                    length = row['width']
-                    width = row['height']
-                    target = row['yTarget']
-                    self.kinematics[slot] = torch.tensor([x, y, xVel, yVel, length, width, vehicle_id, target], dtype=torch.float32)
-                    self.exists[slot] = True
-                    is_agent = bool(row['agent_status'])
-                    self.agent_mask[slot] = is_agent
-                    self.features[slot] = torch.tensor([length, width, target, 1.0 if is_agent else 0.0], dtype=torch.float32)
-                    self.vehicle_ids[slot] = vehicle_id
-            # (Do not increment here either.)
-        
-        # Advance expert_frame_idx based on self.dt.
-        if self.expert_data is not None:
-            skip = int(self.dt * 25)  # For example, dt=0.2 -> skip=5 frames.
-            self.expert_frame_idx += skip
-        
-        # self.history = torch.cat([self.history[1:], self.kinematics.unsqueeze(0)], dim=0)
+                # Sample vehicle type
+                truck = np.random.rand() < self.lane_truck_ratio[l]
+                # Get vehicle parameters
+                length = np.random.normal(15.7, 2.5) if truck else np.random.normal(4.6, 0.3) 
+                width = np.random.normal(2.5, 0.07) if truck else np.random.normal(1.8, 0.01)
+                # Get initial spawn positions
+                x = self.road_start - 0.5*length if self.road_start < self.road_end else self.road_start + 0.5*length
+                y = lcenter + np.random.normal(scale=0.2)
+                xVel = self.lane_avg_speed[l]
+                yVel = 0
+                vehicle_id = self.cumu_id + 1
+                target = np.random.choice(self.lanecenters, p=self.lane_change_ratio[l])
+                # Kinematic tensor of newly spawned vehicle
+                spawned = torch.tensor([x, y, xVel, yVel, length, width, vehicle_id, target], dtype=torch.float32)
+                # Check if feasible to spawn this vehicle otherwise collide
+                exist_kinematics = self.kinematics[self.exists] 
+                spawn_collide = self.check_collision(spawned, exist_kinematics)
+                # If collide, don't spawn
+                if spawn_collide:
+                    continue
+                # Otherwise, spawn this vehicle
+                slot = int(empty_slots[0])
+                self.kinematics[slot] = spawned
+                self.exists[slot] = True
+                is_agent = True
+                self.agent_mask[slot] = is_agent
+                # self.features[slot] = torch.tensor([length, width, target, 1.0], dtype=torch.float32)
+                self.vehicle_ids[slot] = vehicle_id
+                self.cumu_id += 1
+            # Advance expert_frame_idx based on self.dt.
+            if self.expert_data is not None:
+                skip = int(self.dt * 25)  # For example, dt=0.2 -> skip=5 frames.
+                self.expert_frame_idx += skip
+
+        # Update the history states / memories
         self.history[:-1] = self.history[1:].clone()
         self.history[-1] = self.kinematics.clone()
         
+        # Fetch the reward
         reward = 0.0  # placeholder reward
         done = False
         info = {}
         return self._get_obs(), reward, done, info
+    
+    def check_collision(self, spawned, exist_kinematics):
+        """
+        Checks if a newly spawned vehicle collides with any of the existing vehicles.
+        
+        Parameters:
+            spawned (torch.Tensor): A tensor of shape (8,) with elements:
+                                    [x, y, xVelocity, yVelocity, length, width, vehicle_id, target].
+            exist_kinematics (torch.Tensor): A tensor of shape (n, 7) with each row:
+                                    [x, y, xVelocity, yVelocity, length, width, id].
+        
+        Returns:
+            bool: True if there is a collision, False otherwise.
+        """
+        # For the newly spawned vehicle:
+        spawn_x, spawn_y, _, _, spawn_length, spawn_width = spawned[:6]
+        spawn_x_min = spawn_x - spawn_length / 2
+        spawn_x_max = spawn_x + spawn_length / 2
+        spawn_y_min = spawn_y - spawn_width / 2
+        spawn_y_max = spawn_y + spawn_width / 2
+
+        # For the existing vehicles:
+        exist_x = exist_kinematics[:, 0]
+        exist_y = exist_kinematics[:, 1]
+        exist_length = exist_kinematics[:, 4]
+        exist_width = exist_kinematics[:, 5]
+        
+        exist_x_min = exist_x - exist_length / 2
+        exist_x_max = exist_x + exist_length / 2
+        exist_y_min = exist_y - exist_width / 2
+        exist_y_max = exist_y + exist_width / 2
+        
+        # Check for overlap in the x direction and y direction:
+        overlap_x = (spawn_x_min < exist_x_max) & (spawn_x_max > exist_x_min)
+        overlap_y = (spawn_y_min < exist_y_max) & (spawn_y_max > exist_y_min)
+        
+        # A collision occurs if there is overlap in both directions.
+        collision = (overlap_x & overlap_y).any().item()  # .item() converts the tensor scalar to a Python bool
+        return collision
 
     def _get_obs(self):
         """
@@ -356,15 +557,14 @@ class HighwayEnv(gym.Env):
          - mask: vehicle existence mask
          - agent_mask: agent-controlled vehicle mask
         """
-        lane_markers_tensor = torch.tensor(self.lanemarkers, dtype=torch.float32) if self.lanemarkers.size else torch.tensor([])
-        boundary_lines_tensor = torch.tensor(self.boundarylines, dtype=torch.float32) if self.boundarylines.size else torch.tensor([])
-        time_dependent = self.history[:, :, 0:4].clone()
+        
+        time_dependent = self.history[:, :, (0,1,2,3,4,5,7)].clone()
         return {
             'time_dependent': time_dependent,
-            'time_independent': self.features.clone(),
-            'lane_markers': lane_markers_tensor,
-            'boundary_lines': boundary_lines_tensor,
-            'mask': self.exists.float().clone(),
+            # 'time_independent': self.features.clone(),
+            'lane_markers': self.lane_markers_tensor,
+            'boundary_lines': self.boundary_lines_tensor,
+            # 'mask': self.exists.float().clone(),
             'agent_mask': self.agent_mask.float().clone()
         }
 
@@ -395,8 +595,6 @@ class HighwayEnv(gym.Env):
         for marker in self.lanemarkers:
             ax.plot([self.road_start, self.road_end], [marker, marker], color='white', linestyle='--', linewidth=1)
         
-        car_length = 5.0
-        car_width = 2.0
         kinematics_np = self.kinematics.cpu().numpy()
         exists_np = self.exists.cpu().numpy()
         agent_mask_np = self.agent_mask.cpu().numpy()
@@ -404,15 +602,18 @@ class HighwayEnv(gym.Env):
             if exists_np[i]:
                 x = kinematics_np[i, 0]
                 y = kinematics_np[i, 1]
+                length = kinematics_np[i, 4]
+                width = kinematics_np[i, 5]
                 color = 'red' if agent_mask_np[i] else 'blue'
-                rect = plt.Rectangle((x - car_length/2, y - car_width/2), car_length, car_width, color=color)
+                rect = plt.Rectangle((x - length/2, y - width/2), length, width, color=color)
                 ax.add_patch(rect)
+                ax.annotate(kinematics_np[i, -2], kinematics_np[i, :2])
         
-        ax.set_xlim(self.road_start - 10, self.road_end + 10)
+        _ = ax.set_xlim(self.road_start, self.road_end) if self.road_start < self.road_end else ax.set_xlim(self.road_end, self.road_start)
         ax.set_ylim(upper_bound + 5, lower_bound - 5)
         ax.set_xlabel('Position along road (x)')
         ax.set_ylabel('Lateral position (y)')
-        ax.set_title('Highway Vehicle Simulation')
+        # ax.set_title('Highway Vehicle Simulation')
         ax.set_aspect('equal')
         plt.show()
 
